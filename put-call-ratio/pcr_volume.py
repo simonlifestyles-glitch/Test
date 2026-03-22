@@ -1,35 +1,46 @@
 import yfinance as yf
 
 # ═══════════════════════════════════════════
-# 📐 函式定義
+# 說明
+# ═══════════════════════════════════════════
+# Volume 版邏輯：
+#   - 抓取該股票「所有到期日」的選擇權成交量
+#   - 加總全部到期日的 Put / Call 當日成交量
+#   - 反映投資者今日對短中長期的整體看法
+#   - 注意：yfinance volume 為當日資料，無法抓歷史每日成交量
+
+# ═══════════════════════════════════════════
+# 函式定義
 # ═══════════════════════════════════════════
 
 def get_pcr_volume(symbol: str):
     """
-    計算個股的 Put-Call Ratio（PCR）
-    使用當日成交量（Volume）計算
-    反映：今日即時市場情緒
+    計算 PCR（成交量版）
+    加總所有到期日的當日 Put / Call 成交量
     """
     tk = yf.Ticker(symbol)
 
     expirations = tk.options
     if not expirations:
         print(f"找不到 {symbol} 的選擇權資料，請確認代碼是否正確。")
-        return None
+        return None, None, None
 
     total_put  = 0
     total_call = 0
 
-    for date in expirations[:3]:  # 最近 3 個到期日
+    print(f"  正在抓取 {len(expirations)} 個到期日的資料...")
+
+    for date in expirations:  # 全部到期日
         chain = tk.option_chain(date)
         total_put  += chain.puts['volume'].fillna(0).sum()
         total_call += chain.calls['volume'].fillna(0).sum()
 
     if total_call == 0:
         print(f"  {symbol} 的 Call 成交量為 0，無法計算 PCR。")
-        return None
+        return None, None, None
 
-    return total_put / total_call
+    pcr = total_put / total_call
+    return pcr, total_put, total_call
 
 
 def score_pcr(pcr: float) -> dict:
@@ -55,28 +66,30 @@ def score_pcr(pcr: float) -> dict:
 
 def analyze(symbol: str):
     symbol = symbol.upper().strip()
-    print(f"\n{'=' * 47}")
+    print(f"\n{'=' * 50}")
     print(f"  {symbol} - PCR 情緒分析 ( 成交量版 )")
-    print(f"{'=' * 47}")
+    print(f"{'=' * 50}")
 
-    pcr = get_pcr_volume(symbol)
+    pcr, total_put, total_call = get_pcr_volume(symbol)
     if pcr is None:
         return
 
     result = score_pcr(pcr)
 
-    print(f"  計算方式    : 當日成交量 (Volume)")
-    print(f"  適合用途    : 盤中即時情緒判斷")
+    print(f"  計算方式    : 當日成交量 (Volume)，全部到期日")
+    print(f"  適合用途    : 反映投資者今日短中長期整體看法")
+    print(f"  Put 成交量  : {int(total_put):,}")
+    print(f"  Call 成交量 : {int(total_call):,}")
     print(f"  PCR 數值    : {pcr:.4f}")
     print(f"  市場情緒    : {result['sentiment']}")
     print(f"  情緒說明    : {result['desc']}")
     print(f"  參考建議    : {result['suggestion']}")
-    print(f"{'-' * 47}")
+    print(f"{'-' * 50}")
     print(f"  評分依據：")
     print(f"    PCR 0.7 ~ 1.0  ->  中立 (不確定因素高)")
     print(f"    PCR < 0.7      ->  樂觀 (Call 主導)")
     print(f"    PCR > 1.0      ->  悲觀 (Put 主導)")
-    print(f"{'=' * 47}\n")
+    print(f"{'=' * 50}\n")
 
 
 # ═══════════════════════════════════════════
@@ -84,11 +97,12 @@ def analyze(symbol: str):
 # ═══════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("=" * 47)
-    print("   PCR 市場情緒分析 - 成交量版  v1.0")
+    print("=" * 50)
+    print("   PCR 市場情緒分析 - 成交量版  v2.0")
     print("   資料來源 : Yahoo Finance (yfinance)")
-    print("   計算基準 : 當日 Volume，即時反映今日情緒")
-    print("=" * 47)
+    print("   計算基準 : 當日全部到期日 Volume 加總")
+    print("=" * 50)
+    print("  注意：Volume 為當日資料，建議盤中後段查詢")
     print("  輸入 q 離開程式\n")
 
     while True:
