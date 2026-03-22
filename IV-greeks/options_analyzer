@@ -1,0 +1,466 @@
+import warnings
+warnings.filterwarnings('ignore')
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import platform
+from datetime import datetime, date
+
+# ── 選用 py_vollib，若未安裝則 fallback 到 scipy BSM ──────────
+try:
+    from py_vollib.black_scholes.implied_volatility import implied_volatility as calc_iv
+    from py_vollib.black_scholes.greeks.analytical import (
+        delta as calc_delta,
+        gamma as calc_gamma,
+        theta as calc_theta,
+        vega  as calc_vega,
+        rho   as calc_rho,
+    )
+    VOLLIB = True
+except ImportError:
+    from scipy.stats import norm
+    VOLLIB = False
+    print("[警告] py_vollib 未安裝，改用內建 BSM 計算 Greeks。")
+    print("       建議執行：pip install py_vollib\n")
+
+
+# ═══════════════════════════════════════════
+# 中文字型
+# ═══════════════════════════════════════════
+
+def set_font():
+    system = platform.system()
+    if system == 'Windows':
+        plt.rcParams['font.family'] = 'Microsoft JhengHei'
+    elif system == 'Darwin':
+        plt.rcParams['font.family'] = 'Arial Unicode MS'
+    else:
+        plt.rcParams['font.family'] = 'DejaVu Sans'
+    plt.rcParams['axes.unicode_minus'] = False
+
+set_font()
+
+
+# ═══════════════════════════════════════════
+# BSM Fallback（當 py_vollib 未安裝時使用）
+# ═══════════════════════════════════════════
+
+def _d1(S, K, t, r, sigma):
+    return (np.log(S / K) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+
+def _d2(S, K, t, r, sigma):
+    return _d1(S, K, t, r, sigma) - sigma * np.sqrt(t)
+
+def bsm_price(flag, S, K, t, r, sigma):
+    d1 = _d1(S, K, t, r, sigma)
+    d2 = _d2(S, K, t, r, sigma)
+    if flag == 'c':
+        return S * norm.cdf(d1) - K * np.exp(-r * t) * norm.cdf(d2)
+    else:
+        return K * np.exp(-r * t) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+def bsm_iv(market_price, S, K, t, r, flag, tol=1e-6, max_iter=200):
+    lo, hi = 1e-6, 10.0
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2
+        p   = bsm_price(flag, S, K, t, r, mid)
+        if abs(p - market_price) < tol:
+            return mid
+        if p < market_price:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+def bsm_greeks(flag, S, K, t, r, sigma):
+    d1 = _d1(S, K, t, r, sigma)
+    d2 = _d2(S, K, t, r, sigma)
+    sign = 1 if flag == 'c' else -1
+    delta_ = sign * norm.cdf(sign * d1)
+    gamma_ = norm.pdf(d1) / (S * sigma * np.sqrt(t))
+    theta_ = (-(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(t))
+              - sign * r * K * np.exp(-r * t) * norm.cdf(sign * d2)) / 365
+    vega_  = S * norm.pdf(d1) * np.sqrt(t) / 100
+    rho_   = sign * K * t * np.exp(-r * t) * norm.cdf(sign * d2) / 100
+    return delta_, gamma_, theta_, vega_, rho_
+
+
+# ═══════════════════════════════════════════
+# 計算 HV（歷史波動率）
+# ═══════════════════════════════════════════
+
+def calc_hv(symbol: str, window: int = 30) -> float:
+    hist = yf.download(symbol, period='90d', progress=False)
+    if hist.empty:
+        return None
+    closes = hist['Close'].squeeze()
+    log_returns = np.log(closes / closes.shift(1)).dropna()
+    hv = log_returns.rolling(window).std().iloc[-1] * np.sqrt(252)
+    return float(hv)
+
+
+# ═══════════════════════════════════════════
+# 主分析函式
+# ═══════════════════════════════════════════
+
+def analyze_options(symbol: str, r: float = 0.05):
+    """
+    symbol : 股票代碼
+    r      : 無風險利率（預設 5%）
+    """
+    symbol = symbol.upper().strip()
+    tk     = yf.Ticker(symbol)
+
+    # 現價
+    try:
+        S = float(tk.fast_info['last_price'])
+    except Exception:
+        print(f"無法取得 {symbol} 現價，請確認代碼。")
+        return None
+
+    # 所有到期日
+    expirations = tk.options
+    if not expirations:
+        print(f"找不到 {symbol} 的選擇權資料。")
+        return None
+
+    # HV
+    hv = calc_hv(symbol)
+
+    today = date.today()
+    rows  = []
+
+    print(f"\n正在處理 {len(expirations)} 個到期日，請稍候...")
+
+    for exp_date in expirations:
+        # 到期日距今天數
+        exp_dt = datetime.strptime(exp_date, '%Y-%m-%d').date()
+        days   = (exp_dt - today).days
+        if days <= 0:
+            continue
+        t = days / 365.0
+
+        chain = tk.option_chain(exp_date)
+
+        for opt_type, df_chain in [('call', chain.calls), ('put', chain.puts)]:
+            flag = 'c' if opt_type == 'call' else 'p'
+
+            for _, row in df_chain.iterrows():
+                K           = float(row['strike'])
+                mkt_price   = float(row.get('lastPrice', 0) or 0)
+                mkt_iv      = float(row.get('impliedVolatility', 0) or 0)
+
+                # 跳過沒有報價的合約
+                if mkt_price <= 0 or K <= 0:
+                    continue
+
+                # IV（優先用市場報的 IV，若為 0 則用 py_vollib 反推）
+                iv = mkt_iv
+                if iv <= 0 or iv > 5:
+                    try:
+                        if VOLLIB:
+                            iv = calc_iv(mkt_price, S, K, t, r, flag)
+                        else:
+                            iv = bsm_iv(mkt_price, S, K, t, r, flag)
+                    except Exception:
+                        iv = None
+
+                if not iv or iv <= 0:
+                    continue
+
+                # Greeks
+                try:
+                    if VOLLIB:
+                        d = calc_delta(flag, S, K, t, r, iv)
+                        g = calc_gamma(flag, S, K, t, r, iv)
+                        th = calc_theta(flag, S, K, t, r, iv)
+                        v = calc_vega(flag, S, K, t, r, iv)
+                        rh = calc_rho(flag, S, K, t, r, iv)
+                    else:
+                        d, g, th, v, rh = bsm_greeks(flag, S, K, t, r, iv)
+                except Exception:
+                    continue
+
+                # 理論價格（BSM）
+                try:
+                    theo_price = bsm_price(flag, S, K, t, r, iv)
+                except Exception:
+                    theo_price = None
+
+                rows.append({
+                    'expiration'  : exp_date,
+                    'days_to_exp' : days,
+                    'type'        : opt_type,
+                    'strike'      : K,
+                    'market_price': round(mkt_price, 4),
+                    'theo_price'  : round(theo_price, 4) if theo_price else None,
+                    'IV'          : round(iv * 100, 2),        # 以 % 顯示
+                    'HV_30'       : round(hv * 100, 2) if hv else None,
+                    'IV_HV_diff'  : round((iv - hv) * 100, 2) if hv else None,
+                    'delta'       : round(d, 4),
+                    'gamma'       : round(g, 6),
+                    'theta'       : round(th, 4),
+                    'vega'        : round(v, 4),
+                    'rho'         : round(rh, 4),
+                })
+
+    if not rows:
+        print("無法取得有效選擇權資料。")
+        return None
+
+    df = pd.DataFrame(rows)
+    return df, S, hv, symbol
+
+
+# ═══════════════════════════════════════════
+# 文字報告
+# ═══════════════════════════════════════════
+
+def print_report(df: pd.DataFrame, S: float, hv: float, symbol: str):
+    print(f"\n{'=' * 70}")
+    print(f"  {symbol}  Options Analysis Report")
+    print(f"{'=' * 70}")
+    print(f"  現價 (Current Price) : {S:.2f}")
+    print(f"  30日歷史波動率 (HV)  : {hv*100:.2f}%" if hv else "  HV : N/A")
+    print(f"  總合約數             : {len(df):,}")
+    print(f"  到期日數量           : {df['expiration'].nunique()}")
+    print(f"{'─' * 70}")
+
+    # 每個到期日印出 ATM 附近的合約
+    for exp in sorted(df['expiration'].unique()):
+        df_exp = df[df['expiration'] == exp].copy()
+        days   = df_exp['days_to_exp'].iloc[0]
+
+        # ATM = 最接近現價的 Strike
+        strikes = df_exp['strike'].unique()
+        atm     = strikes[np.argmin(np.abs(strikes - S))]
+
+        df_atm  = df_exp[df_exp['strike'] == atm].sort_values('type')
+
+        print(f"\n  到期日: {exp}  ({days}天後)")
+        print(f"  ATM 履約價: {atm}")
+        print(f"  {'Type':<6} {'Strike':>8} {'Mkt Price':>10} {'Theo':>8} "
+              f"{'IV%':>7} {'IV-HV':>7} {'Delta':>7} {'Gamma':>8} "
+              f"{'Theta':>7} {'Vega':>7} {'Rho':>7}")
+        print(f"  {'-'*96}")
+
+        for _, r_row in df_atm.iterrows():
+            iv_hv = f"{r_row['IV_HV_diff']:+.2f}" if r_row['IV_HV_diff'] is not None else "  N/A"
+            print(f"  {r_row['type']:<6} {r_row['strike']:>8.1f} "
+                  f"{r_row['market_price']:>10.4f} {r_row['theo_price']:>8.4f} "
+                  f"{r_row['IV']:>6.2f}% {iv_hv:>7} "
+                  f"{r_row['delta']:>7.4f} {r_row['gamma']:>8.6f} "
+                  f"{r_row['theta']:>7.4f} {r_row['vega']:>7.4f} {r_row['rho']:>7.4f}")
+
+    print(f"\n{'=' * 70}\n")
+
+
+
+# ═══════════════════════════════════════════
+# 選擇到期日（互動式，最多3個）
+# ═══════════════════════════════════════════
+
+def pick_expirations(all_exps: list, max_pick: int = 3) -> list:
+    """
+    列出所有到期日讓使用者選擇最多 3 個，
+    若直接按 Enter 則自動選前 3 個。
+    """
+    print(f"\n  可用到期日（共 {len(all_exps)} 個）：")
+    for i, exp in enumerate(all_exps):
+        print(f"    [{i+1:>2}] {exp}")
+
+    print(f"\n  請輸入最多 {max_pick} 個編號，用逗號分隔")
+    print(f"  （直接按 Enter 自動選前 {max_pick} 個）")
+    raw = input("  你的選擇：").strip()
+
+    if not raw:
+        chosen = all_exps[:max_pick]
+        print(f"  自動選取：{chosen}")
+        return chosen
+
+    try:
+        indices = [int(x.strip()) - 1 for x in raw.split(',')]
+        indices = [i for i in indices if 0 <= i < len(all_exps)][:max_pick]
+        chosen  = [all_exps[i] for i in indices]
+        print(f"  已選取：{chosen}")
+        return chosen
+    except ValueError:
+        print("  輸入有誤，自動選取前 3 個。")
+        return all_exps[:max_pick]
+
+
+# ═══════════════════════════════════════════
+# 圖表
+# ═══════════════════════════════════════════
+
+def plot_report(df: pd.DataFrame, S: float, hv: float, symbol: str):
+
+    all_exps    = sorted(df['expiration'].unique())
+    greek_exps  = pick_expirations(all_exps, max_pick=3)
+
+    # IV Smile / Term Structure 用全部到期日
+    colors = plt.cm.tab10.colors
+
+    # ── 圖1 + 圖2：IV（上排）──────────────────
+    fig1, axes1 = plt.subplots(1, 2, figsize=(16, 5))
+    fig1.suptitle(f"{symbol}  IV Analysis  |  Price: {S:.2f}",
+                  fontsize=13, fontweight='bold')
+
+    # 圖1：IV Smile（全部到期日，最多顯示 12 條）
+    ax = axes1[0]
+    smile_exps = all_exps[:12]
+    for i, exp in enumerate(smile_exps):
+        sub = df[(df['expiration'] == exp) & (df['type'] == 'call')]
+        ax.plot(sub['strike'], sub['IV'], marker='o', ms=2.5,
+                label=exp[5:], color=colors[i % 10], alpha=0.8)
+    if hv:
+        ax.axhline(hv * 100, color='black', linestyle='--', lw=1.5,
+                   label=f'HV30: {hv*100:.1f}%')
+    ax.axvline(S, color='gold', lw=2, linestyle='-', label=f'Price: {S:.1f}')
+    ax.set_title('IV Smile — Call (All Expirations)')
+    ax.set_xlabel('Strike')
+    ax.set_ylabel('IV (%)')
+    ax.legend(fontsize=6, ncol=2)
+    ax.grid(True, alpha=0.3)
+
+    # 圖2：IV Term Structure（全部到期日）
+    ax = axes1[1]
+    atm_iv_call, atm_iv_put, exp_labels, days_list = [], [], [], []
+    hv_val = hv * 100 if hv else None
+
+    for exp in all_exps:
+        sub_exp = df[df['expiration'] == exp]
+        strikes = sub_exp['strike'].unique()
+        atm     = strikes[np.argmin(np.abs(strikes - S))]
+        c_iv = sub_exp[(sub_exp['type'] == 'call') & (sub_exp['strike'] == atm)]['IV']
+        p_iv = sub_exp[(sub_exp['type'] == 'put')  & (sub_exp['strike'] == atm)]['IV']
+        atm_iv_call.append(c_iv.values[0] if len(c_iv) > 0 else np.nan)
+        atm_iv_put.append( p_iv.values[0] if len(p_iv) > 0 else np.nan)
+        exp_labels.append(exp)
+        days_list.append(sub_exp['days_to_exp'].iloc[0])
+
+    x_idx = list(range(len(exp_labels)))
+
+    ax.plot(x_idx, atm_iv_call, marker='o', ms=5, label='Call ATM IV',
+            color='steelblue', lw=1.5)
+    ax.plot(x_idx, atm_iv_put,  marker='s', ms=5, label='Put ATM IV',
+            color='tomato', lw=1.5)
+
+    # 標示異常偏高（超過 HV 的 1.5 倍）
+    if hv_val:
+        threshold = hv_val * 1.5
+        ax.axhline(hv_val,   color='black',  linestyle='--', lw=1.5,
+                   label=f'HV30: {hv_val:.1f}%')
+        ax.axhline(threshold, color='orange', linestyle=':', lw=1.5,
+                   label=f'Abnormal threshold: {threshold:.1f}%')
+        for i, (cv, pv) in enumerate(zip(atm_iv_call, atm_iv_put)):
+            if not np.isnan(cv) and cv > threshold:
+                ax.annotate(f'High IV!\n{exp_labels[i][5:]}',
+                            xy=(i, cv), xytext=(i + 0.3, cv + 1),
+                            fontsize=7, color='red',
+                            arrowprops=dict(arrowstyle='->', color='red', lw=1))
+            if not np.isnan(pv) and pv > threshold:
+                ax.annotate(f'High IV!\n{exp_labels[i][5:]}',
+                            xy=(i, pv), xytext=(i + 0.3, pv + 1),
+                            fontsize=7, color='darkred',
+                            arrowprops=dict(arrowstyle='->', color='darkred', lw=1))
+
+    ax.set_xticks(x_idx)
+    ax.set_xticklabels([f"{e[5:]}\n({d}d)" for e, d in zip(exp_labels, days_list)],
+                       fontsize=6, rotation=45)
+    ax.set_title('IV Term Structure — ATM (All Expirations)\n'
+                 'Orange dotted = 1.5x HV30 (Abnormal threshold)')
+    ax.set_xlabel('Expiration (days to expiry)')
+    ax.set_ylabel('IV (%)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    f1name = f"{symbol}_IV_analysis.png"
+    plt.savefig(f1name, dpi=150, bbox_inches='tight')
+    print(f"\n  IV 圖表已儲存至 {f1name}")
+    plt.show()
+
+    # ── 圖3~6：Greeks（選定的最多3個到期日）────
+    fig2, axes2 = plt.subplots(2, 2, figsize=(16, 10))
+    fig2.suptitle(
+        f"{symbol}  Greeks vs Strike  |  Price: {S:.2f}\n"
+        f"Expirations: {', '.join(greek_exps)}",
+        fontsize=13, fontweight='bold'
+    )
+
+    greek_colors = ['steelblue', 'tomato', 'seagreen']
+    greek_list   = [
+        ('delta', 'Delta', axes2[0, 0]),
+        ('gamma', 'Gamma', axes2[0, 1]),
+        ('theta', 'Theta (per day)', axes2[1, 0]),
+        ('vega',  'Vega',  axes2[1, 1]),
+    ]
+
+    for col, ylabel, ax in greek_list:
+        for j, exp in enumerate(greek_exps):
+            sub_c = df[(df['expiration'] == exp) & (df['type'] == 'call')]
+            sub_p = df[(df['expiration'] == exp) & (df['type'] == 'put')]
+            days  = df[df['expiration'] == exp]['days_to_exp'].iloc[0]
+            lbl   = f"{exp[5:]} ({days}d)"
+            c     = greek_colors[j % 3]
+
+            ax.plot(sub_c['strike'], sub_c[col], marker='o', ms=3,
+                    label=f'Call {lbl}', color=c, lw=1.5)
+            ax.plot(sub_p['strike'], sub_p[col], marker='s', ms=3,
+                    label=f'Put {lbl}',  color=c, lw=1.5, linestyle='--')
+
+        ax.axvline(S, color='gold', lw=2, linestyle='-', label=f'Price: {S:.1f}')
+        if col in ('delta', 'theta'):
+            ax.axhline(0, color='gray', lw=0.8, linestyle='--')
+        ax.set_title(f'{ylabel} vs Strike')
+        ax.set_xlabel('Strike')
+        ax.set_ylabel(ylabel)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    f2name = f"{symbol}_Greeks_analysis.png"
+    plt.savefig(f2name, dpi=150, bbox_inches='tight')
+    print(f"  Greeks 圖表已儲存至 {f2name}")
+    plt.show()
+
+
+# ═══════════════════════════════════════════
+# 主程式
+# ═══════════════════════════════════════════
+
+if __name__ == "__main__":
+    print("=" * 55)
+    print("   Options Analyzer  v2.0")
+    print("   IV / HV / Greeks / Option Price")
+    print("   Data  : yfinance  |  Model : BSM")
+    print("=" * 55)
+    print("  輸入 q 離開\n")
+
+    while True:
+        symbol = input("  請輸入股票代碼 (例如 AAPL、TSLA、SPY)：").strip()
+
+        if symbol.lower() in ('q', 'quit', 'exit'):
+            print("\n  已離開程式，再見！\n")
+            break
+
+        if not symbol:
+            print("  請輸入股票代碼\n")
+            continue
+
+        result = analyze_options(symbol)
+        if result is None:
+            continue
+
+        df, S, hv, sym = result
+
+        print_report(df, S, hv, sym)
+        plot_report(df, S, hv, sym)
+
+        csv_name = f"{sym}_options_full.csv"
+        df.to_csv(csv_name, index=False)
+        print(f"  完整資料已儲存至 {csv_name}\n")
