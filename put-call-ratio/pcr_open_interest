@@ -1,82 +1,180 @@
 import yfinance as yf
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import matplotlib.font_manager as fm
+import platform
 
 # ═══════════════════════════════════════════
-# 📐 函式定義
+# 中文字型設定（解決 Windows 亂碼）
 # ═══════════════════════════════════════════
 
-def get_pcr_oi(symbol: str):
+def set_chinese_font():
+    system = platform.system()
+    if system == 'Windows':
+        plt.rcParams['font.family'] = 'Microsoft JhengHei'  # 微軟正黑體
+    elif system == 'Darwin':
+        plt.rcParams['font.family'] = 'Arial Unicode MS'
+    else:
+        plt.rcParams['font.family'] = 'WenQuanYi Micro Hei'
+    plt.rcParams['axes.unicode_minus'] = False  # 負號正常顯示
+
+set_chinese_font()
+
+
+# ═══════════════════════════════════════════
+# 函式定義
+# ═══════════════════════════════════════════
+
+def get_all_oi(symbol: str):
     """
-    計算個股的 Put-Call Ratio（PCR）
-    使用未平倉量（Open Interest）計算
-    反映：市場累積的整體部位
+    抓取所有到期日的 OI 資料，合併成一張完整的表
+    回傳：以履約價為單位的 Put OI / Call OI 加總
     """
     tk = yf.Ticker(symbol)
 
     expirations = tk.options
     if not expirations:
         print(f"找不到 {symbol} 的選擇權資料，請確認代碼是否正確。")
-        return None
+        return None, None
 
-    total_put  = 0
-    total_call = 0
+    all_calls = []
+    all_puts  = []
 
-    for date in expirations[:3]:  # 最近 3 個到期日
+    print(f"  正在抓取 {len(expirations)} 個到期日的 OI 資料...")
+
+    for date in expirations:
         chain = tk.option_chain(date)
-        total_put  += chain.puts['openInterest'].fillna(0).sum()
-        total_call += chain.calls['openInterest'].fillna(0).sum()
 
-    if total_call == 0:
-        print(f"  {symbol} 的 Call 未平倉量為 0，無法計算 PCR。")
+        calls = chain.calls[['strike', 'openInterest']].copy()
+        calls['openInterest'] = calls['openInterest'].fillna(0)
+        all_calls.append(calls)
+
+        puts = chain.puts[['strike', 'openInterest']].copy()
+        puts['openInterest'] = puts['openInterest'].fillna(0)
+        all_puts.append(puts)
+
+    df_calls = pd.concat(all_calls).groupby('strike')['openInterest'].sum().reset_index()
+    df_puts  = pd.concat(all_puts).groupby('strike')['openInterest'].sum().reset_index()
+
+    df_calls.columns = ['strike', 'call_oi']
+    df_puts.columns  = ['strike', 'put_oi']
+
+    df = pd.merge(df_calls, df_puts, on='strike', how='outer').fillna(0)
+    df = df.sort_values('strike').reset_index(drop=True)
+
+    return df, tk
+
+
+def get_current_price(tk) -> float:
+    try:
+        return tk.fast_info['last_price']
+    except Exception:
         return None
 
-    return total_put / total_call
 
+def plot_oi(df: pd.DataFrame, symbol: str, current_price: float):
+    """
+    畫出 OI 分布圖
+    - 藍色：Call OI（壓力）
+    - 紅色：Put OI（支撐）
+    - 黃色虛線：目前股價
+    - 標出 Call Wall 和 Put Wall
+    """
+    # Call Wall / Put Wall
+    call_wall_strike = df.loc[df['call_oi'].idxmax(), 'strike']
+    put_wall_strike  = df.loc[df['put_oi'].idxmax(),  'strike']
+    call_wall_oi     = df['call_oi'].max()
+    put_wall_oi      = df['put_oi'].max()
 
-def score_pcr(pcr: float) -> dict:
-    if 0.7 <= pcr <= 1.0:
-        return {
-            "sentiment":  "中立",
-            "desc":       "市場情緒中立，不確定因素性高",
-            "suggestion": "觀望為主，等待方向確認後再行動",
-        }
-    elif pcr < 0.7:
-        return {
-            "sentiment":  "樂觀",
-            "desc":       "市場情緒較樂觀，Call 部位累積偏多",
-            "suggestion": "市場整體偏多，但需留意過度樂觀帶來的回落風險",
-        }
+    # 整體 PCR
+    total_put_oi  = df['put_oi'].sum()
+    total_call_oi = df['call_oi'].sum()
+    pcr = total_put_oi / total_call_oi if total_call_oi > 0 else None
+
+    # 只顯示現價 ±30% 範圍
+    if current_price:
+        lower    = current_price * 0.7
+        upper    = current_price * 1.3
+        df_plot  = df[(df['strike'] >= lower) & (df['strike'] <= upper)]
     else:
-        return {
-            "sentiment":  "悲觀",
-            "desc":       "市場情緒較悲觀，Put 部位累積偏多",
-            "suggestion": "市場整體偏空，但逆向思考：極度悲觀時往往是潛在買點",
-        }
+        df_plot = df
+
+    strikes      = df_plot['strike'].values
+    bar_width    = (strikes[1] - strikes[0]) * 0.6 if len(strikes) > 1 else 1.0
+
+    # ── 繪圖 ──────────────────────────────────
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+    fig.suptitle(
+        f"{symbol}  Option Open Interest Distribution\n(All Expiration Dates)",
+        fontsize=14, fontweight='bold'
+    )
+
+    # 上圖：Call OI
+    axes[0].bar(df_plot['strike'], df_plot['call_oi'],
+                color='steelblue', alpha=0.85, width=bar_width, label='Call OI')
+    axes[0].axvline(call_wall_strike, color='navy', linestyle='--', lw=2.5,
+                    label=f'Call Wall: {call_wall_strike}  (OI: {int(call_wall_oi):,})')
+    if current_price:
+        axes[0].axvline(current_price, color='gold', linestyle='-', lw=2.5,
+                        label=f'Current Price: {current_price:.2f}')
+    axes[0].set_title('Call OI  —  Resistance Level', fontsize=11)
+    axes[0].set_ylabel('Open Interest')
+    axes[0].yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f'{int(x):,}'))
+    axes[0].legend(fontsize=10)
+    axes[0].grid(True, alpha=0.3)
+
+    # 下圖：Put OI
+    axes[1].bar(df_plot['strike'], df_plot['put_oi'],
+                color='tomato', alpha=0.85, width=bar_width, label='Put OI')
+    axes[1].axvline(put_wall_strike, color='darkred', linestyle='--', lw=2.5,
+                    label=f'Put Wall: {put_wall_strike}  (OI: {int(put_wall_oi):,})')
+    if current_price:
+        axes[1].axvline(current_price, color='gold', linestyle='-', lw=2.5,
+                        label=f'Current Price: {current_price:.2f}')
+    axes[1].set_title('Put OI  —  Support Level', fontsize=11)
+    axes[1].set_ylabel('Open Interest')
+    axes[1].set_xlabel('Strike Price')
+    axes[1].yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f'{int(x):,}'))
+    axes[1].legend(fontsize=10)
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    # ── 文字報告 ──────────────────────────────
+    print(f"\n{'=' * 50}")
+    print(f"  {symbol} - OI Distribution Report")
+    print(f"{'=' * 50}")
+    if current_price:
+        print(f"  Current Price : {current_price:.2f}")
+    print(f"  Call Wall     : Strike {call_wall_strike}  (OI: {int(call_wall_oi):,})  <- Resistance")
+    print(f"  Put Wall      : Strike {put_wall_strike}  (OI: {int(put_wall_oi):,})  <- Support")
+    if pcr:
+        if pcr < 0.7:
+            sentiment = "樂觀 (Call OI 主導)"
+        elif pcr <= 1.0:
+            sentiment = "中立 (Put/Call 接近)"
+        else:
+            sentiment = "悲觀 (Put OI 主導)"
+        print(f"  Overall PCR   : {pcr:.4f}  ->  {sentiment}")
+    print(f"{'-' * 50}")
+    print(f"  Call Wall = 壓力位（大量 Call 在此履約價堆積）")
+    print(f"  Put Wall  = 支撐位（大量 Put 在此履約價堆積）")
+    print(f"{'=' * 50}\n")
+
+    filename = f"{symbol}_OI_distribution.png"
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    print(f"  圖表已儲存至 {filename}")
+    plt.show()
 
 
 def analyze(symbol: str):
     symbol = symbol.upper().strip()
-    print(f"\n{'=' * 47}")
-    print(f"  {symbol} - PCR 情緒分析 ( 未平倉量版 )")
-    print(f"{'=' * 47}")
-
-    pcr = get_pcr_oi(symbol)
-    if pcr is None:
+    df, tk = get_all_oi(symbol)
+    if df is None:
         return
-
-    result = score_pcr(pcr)
-
-    print(f"  計算方式    : 未平倉量 (Open Interest)")
-    print(f"  適合用途    : 中長線整體部位判斷")
-    print(f"  PCR 數值    : {pcr:.4f}")
-    print(f"  市場情緒    : {result['sentiment']}")
-    print(f"  情緒說明    : {result['desc']}")
-    print(f"  參考建議    : {result['suggestion']}")
-    print(f"{'-' * 47}")
-    print(f"  評分依據：")
-    print(f"    PCR 0.7 ~ 1.0  ->  中立 (不確定因素高)")
-    print(f"    PCR < 0.7      ->  樂觀 (Call 部位主導)")
-    print(f"    PCR > 1.0      ->  悲觀 (Put 部位主導)")
-    print(f"{'=' * 47}\n")
+    current_price = get_current_price(tk)
+    plot_oi(df, symbol, current_price)
 
 
 # ═══════════════════════════════════════════
@@ -84,12 +182,12 @@ def analyze(symbol: str):
 # ═══════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("=" * 47)
-    print("   PCR 市場情緒分析 - 未平倉量版  v1.0")
-    print("   資料來源 : Yahoo Finance (yfinance)")
-    print("   計算基準 : Open Interest，反映累積整體部位")
-    print("=" * 47)
-    print("  注意：OI 資料為前一日收盤後更新，非即時")
+    print("=" * 50)
+    print("   PCR OI Distribution Tool  v2.1")
+    print("   Data Source : Yahoo Finance (yfinance)")
+    print("   Basis       : All Expiry x All Strike OI")
+    print("=" * 50)
+    print("  注意：OI 為前一日收盤後更新，非即時資料")
     print("  輸入 q 離開程式\n")
 
     while True:
