@@ -90,6 +90,9 @@ python PCR_Bollinger_Strategy.py
 **下圖：累計損益曲線（USD）**
 - 紫色折線追蹤每筆交易後的累計盈虧變化
 
+![圖片說明](Figure_1.png)
+
+
 ---
 
 ## ⚠️ 免責聲明
